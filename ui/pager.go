@@ -198,6 +198,10 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 	// We've received terminal dimensions, either for the first time or
 	// after a resize
 	case tea.WindowSizeMsg:
+		// NOTE: every resize pays a full glamour re-render, and at startup this
+		// races with the render queued by model.Init (bubbletea sends the initial
+		// size itself, and rawPainter's watchResize sends another one). The raw
+		// painter then paints both frames. Cheap to debounce, hard to notice later.
 		return m, renderWithGlamour(m, m.currentDocument.Body)
 
 	case statusMessageTimeoutMsg:
@@ -352,6 +356,26 @@ func renderWithGlamour(m pagerModel, md string) tea.Cmd {
 
 // This is where the magic happens.
 func glamourRender(m pagerModel, markdown string) (string, error) {
+	// WARNING: MaxWidth truncates, it does not re-wrap. Since glamour was asked
+	// to wrap at `width` below (min(GlamourMaxWidth, viewport width)), this cuts
+	// real text off the end of every line that reaches the right edge: a paragraph
+	// keeps its two column left margin, so two columns of text go missing, and a
+	// block with a wider margin loses up to lineNumberWidth columns. The reduced
+	// width has to be passed to glamour, not applied afterwards.
+	//
+	// WARNING: for markdown without line numbers trunc is not used at all. That is
+	// fine only while glamour was actually asked to wrap - it hard-wraps at
+	// `width`, and `width` is min(GlamourMaxWidth, viewport width). It is not fine
+	// when the wrap width is 0 (the first render before the first WindowSizeMsg,
+	// see below) and it cannot help with anything that grows *after* wrapping,
+	// i.e. a scaled heading. Those frames contain lines wider than the terminal
+	// and nothing clamps them: the terminal wraps them, every row below shifts,
+	// and with the raw painter's full-screen repaint the top of the view scrolls
+	// away.
+	//
+	// NOTE: trunc also cannot clip a scaled heading. lipgloss measures the OSC 66
+	// payload as zero width, while the terminal draws it 2x/3x wider; so a
+	// heading always escapes this clamp in either direction.
 	trunc := lipgloss.NewStyle().MaxWidth(m.viewport.Width() - lineNumberWidth).Render
 
 	if !m.common.cfg.GlamourEnabled {
@@ -359,6 +383,13 @@ func glamourRender(m pagerModel, markdown string) (string, error) {
 	}
 
 	isCode := !utils.IsMarkdownFile(m.currentDocument.Note)
+	// BUG: on the first render the viewport width is still 0 (no WindowSizeMsg
+	// has been processed yet), so this becomes WithWordWrap(0) - no wrapping at
+	// all - and that whole unwrapped document is rendered and painted once before
+	// the resize-triggered render replaces it. Nothing sequences the two renders
+	// (both go through the same command queue), so the unwrapped result can even
+	// arrive last and stick until the next resize. Skip the render (or wait for
+	// the size) instead.
 	width := max(0, min(int(m.common.cfg.GlamourMaxWidth), m.viewport.Width())) //nolint:gosec
 	if isCode {
 		width = 0
@@ -389,6 +420,11 @@ func glamourRender(m pagerModel, markdown string) (string, error) {
 	if isCode {
 		out = strings.TrimSpace(out)
 	} else {
+		// NOTE: this is where the 3x/2x/1.5x scaling is produced. Nothing checks
+		// that the scaled heading still fits: glamour wrapped the heading at the
+		// body word-wrap width and s=3 triples its advance width, so any H1 longer
+		// than a third of the terminal re-wraps in the terminal and desynchronizes
+		// the newline padding ApplyTextSizing just added (see the BUG note there).
 		out = utils.ApplyTextSizing(out)
 	}
 
@@ -417,6 +453,11 @@ func (m *pagerModel) initWatcher() {
 	var err error
 	m.watcher, err = fsnotify.NewWatcher()
 	if err != nil {
+		// BUG: m.watcher stays nil. The error is only logged, but watchFile() is
+		// still queued as a command after every contentRenderedMsg and then
+		// dereferences m.watcher.Add() - a nil pointer panic that takes the whole
+		// program down. Either fail the model or make watchFile/unwatchFile
+		// no-ops when watcher is nil.
 		log.Error("error creating fsnotify watcher", "error", err)
 	}
 }

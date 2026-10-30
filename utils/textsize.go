@@ -24,6 +24,12 @@ const (
 	markerClose  = markerPrefix + "0" + osc66ST
 )
 
+// NOTE: caching the decision with sync.OnceValue makes it irreversible. That is
+// a problem for the caller: ui.NewProgram needs to turn sizing back off when it
+// falls back to the normal renderer (the OSC 66 payload would be eaten there),
+// and it cannot. textsize_test.go works around it by reassigning this variable,
+// which is a smell. This belongs in Config, decided once in main, before any
+// renderer exists.
 var textSizingEnabled = sync.OnceValue(detectTextSizing)
 
 // TextSizingEnabled reports whether the terminal supports kitty's text
@@ -39,6 +45,14 @@ func detectTextSizing() bool {
 		return false
 	case "1", "true", "on", "yes":
 		return true
+		// ERROR: rely on the terminal behavior, if the terminal don't discard the control sequence and not support Kitty OSC 66, it might cause issue. But alacritty works fine.
+		// NOTE: in the TUI it is worse than "might cause issue": the fallback
+		// renderer discards the OSC 66 *together with its payload text*, so the
+		// headings disappear rather than render unscaled (verified with
+		// charmbracelet/ultraviolet's ScreenBuffer: "A\x1b]66;s=3;HIDDEN\x1b\\B"
+		// comes out as "AB"). Forcing this on must therefore also guarantee that
+		// the raw painter runs, which the current env override does not (see
+		// ui.NewProgram).
 	}
 
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
@@ -59,6 +73,19 @@ func detectTextSizing() bool {
 
 var cprPattern = regexp.MustCompile(`\x1b\[(\d+);(\d+)R`)
 
+// NOTE: this talks to /dev/tty directly: it puts the tty into raw mode, writes
+// two cursor-position queries plus a probe OSC 66 and gives up after 800ms.
+// Measured on a pty: a plain "glow README.md" does emit one ESC[6n and one
+// OSC 66, so the probe also runs on the non-TUI path (via utils.GlamourStyle ->
+// TextSizingEnabled), not only in the TUI.
+//   - A cursor-position reply that arrives after the timeout stays in the tty
+//     input queue; bubbletea would then read it as keystrokes.
+//   - Only the first two replies are consumed; anything else is left behind.
+//
+// That failure needs a terminal that answers slower than 800ms, which could not
+// be reproduced here, so this is documented rather than counted as a fixable bug.
+// Draining the input queue before returning, and only probing in TUI mode, would
+// remove both.
 func probeTextSizing() (supported, decisive bool) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -120,6 +147,11 @@ func markerOpen(level int) string {
 	return markerPrefix + strconv.Itoa(level) + osc66ST
 }
 
+// NOTE: only a single-digit level is accepted, while markerOpen(level) happily
+// writes longer numbers. A level >= 10 marker is therefore unrecognised:
+// ApplyTextSizing re-emits markerPrefix and treats the rest as text, so the raw
+// escape sequence is passed through to the terminal instead of being consumed.
+// Latent only because nothing marks levels above 3 today.
 func markerLevel(s string) int {
 	if !strings.HasPrefix(s, markerPrefix) {
 		return -1
@@ -137,6 +169,22 @@ func markerLevel(s string) int {
 // the background does not cover the scaled glyphs and renders broken.
 // The style config is modified in place; pass a copy if the original is
 // shared.
+//
+// WARNING: This function only used in test and GlamourStyle, the later is in this file, why expose this?
+// This function bury a pin in the style config, so we can replace the pin with kitty osc66ST later.
+//
+// WARNING: it also mutates the config in place, and the "copy" that
+// styleConfigFor hands over is a shallow struct copy: pointer fields (e.g. the
+// *uint margins set for code styles) still alias styles.DefaultStyles. Only
+// strings are written today, so it happens to be safe - but the next person to
+// touch a pointer field here corrupts the global default style for every later
+// renderer.
+//
+// NOTE: for styles whose prefix starts with '#', the entire prefix is dropped
+// (see below), so H2/H3 lose their "##"/"###" indicator; for any other prefix the
+// prefix is kept and *scaled* (H1's single leading space becomes three columns).
+// Two visually different outcomes from one rule, and a single TrimPrefix only
+// strips one space, so a custom "##   Title" keeps the leftovers.
 func AddHeadingSizeMarkers(cfg *ansi.StyleConfig) {
 	blocks := []struct {
 		level int
@@ -160,6 +208,12 @@ func AddHeadingSizeMarkers(cfg *ansi.StyleConfig) {
 }
 
 func headingRows(level int) int {
+	// WARNING: the row budget is hard-coded and applied blindly: it is only
+	// correct if the terminal scales s=3 into exactly three rows and the 1.5x
+	// span into two, and it is emitted even when the heading was re-wrapped by
+	// the terminal because it did not fit (see the BUG note in ApplyTextSizing).
+	// Nothing here can detect that, so the whole vertical compensation assumes
+	// headingRows(level) terminal rows per rendered line, whatever really happens.
 	if level == 1 {
 		return 3
 	}
@@ -171,11 +225,26 @@ func headingRows(level int) int {
 // headings are scaled 3x, level 2 headings 2x, and level 3 headings 1.5x via
 // fractional scaling with a tight width so glyphs keep their natural width.
 // Output without markers is returned unchanged.
+//
+// BUG: a scaled heading can end up wider than the terminal, and nothing here can
+// notice. glamour wrapped the heading text at the body word-wrap width (see
+// ansi/heading.go, lipgloss.Wrap at bs.Width(ctx)), then s=3 triples its advance
+// width; no re-wrap or clamp happens afterwards. Every width helper in the
+// codebase either miscounts or ignores the payload - ansi.PrintableRuneWidth
+// counts the whole OSC as printable, lipgloss measures it as zero width - so the
+// truncate in pager.glamourRender cannot clip it either. On an 80 column
+// terminal any H1 wider than ~26 cells (i.e. almost all of them) is wrapped by
+// the terminal itself: the heading needs six rows instead of three, the
+// headingRows() compensation below is off, and everything after it drifts.
+// Fix direction: derive w/n/d from the columns actually left on the line, or
+// skip the scaling when the span would not fit.
 func ApplyTextSizing(s string) string {
 	if !strings.Contains(s, markerPrefix) {
 		return s
 	}
-
+	// WARNING: if the markdown already contains the content of prefix and suffix, the text sizing will be applied wrong.
+	// this problem is caused by glamour, we call glamour then apply the kitty osc66ST.
+	// So without a pin, the glamout style control sequences will appear in the osc66ST payload. which is an unexpected behavior for the terminal.
 	var b strings.Builder
 	b.Grow(len(s))
 	for len(s) > 0 {
@@ -195,6 +264,12 @@ func ApplyTextSizing(s string) string {
 		}
 		s = s[len(markerOpen(level)):]
 		if level < 1 || level > 3 {
+			// NOTE: this fails open, and correctly: the span text is kept and the
+			// close marker disappears on the next iteration (markerLevel sees
+			// "...;0..." and lands in this same branch). Levels 0 and 4..9
+			// therefore render as plain text. The one real gap is multi-digit
+			// levels - markerLevel rejects them, so the open marker is re-emitted
+			// verbatim instead of being consumed (see markerLevel).
 			continue
 		}
 
@@ -205,6 +280,11 @@ func ApplyTextSizing(s string) string {
 		}
 		writeSizedSpan(&b, level, s[:end])
 		s = s[end+len(markerClose):]
+		// NOTE: these padding newlines are emitted before the escape sequence that
+		// closes the span (glamour's SGR reset still sits in s), so the blank rows
+		// inherit the heading's style. Harmless today only because headings with a
+		// background are never marked; it makes the row accounting depend on where
+		// the style happens to put its reset.
 		b.WriteString(strings.Repeat("\n", headingRows(level)-1))
 	}
 	return b.String()
@@ -226,6 +306,11 @@ type segment struct {
 }
 
 func writeSizedLine(b *strings.Builder, level int, ln string, continuation bool) {
+	// NOTE: leading whitespace is treated differently per line: on the first line
+	// it stays inside the payload and is scaled (H1's one-space style prefix
+	// becomes three columns), while on continuation lines it is trimmed out (see
+	// below). A wrapped heading therefore has its first row indented and its
+	// following rows flush left.
 	var segs []segment
 	for len(ln) > 0 {
 		i := strings.IndexByte(ln, '\x1b')
@@ -320,6 +405,10 @@ func scanEscape(s string) string {
 }
 
 func sizedChunk(level int, text string) string {
+	// NOTE: every C0/C1 character is dropped from the payload, tabs included. A
+	// heading containing a tab silently loses it (the row becomes narrower than
+	// the source text), and if a malformed escape ever reaches the content its ESC
+	// is stripped here as well.
 	text = strings.Map(func(r rune) rune {
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 			return -1
@@ -358,6 +447,14 @@ func osc66Chunks(meta, text string) string {
 }
 
 func osc66TightChunks(text string) string {
+	// QUESTION: s=2:n=3:d=4 and w=(width*3+3)/4 are undocumented magic. If w is
+	// meant to be the cell width of the *scaled* result, four columns of text
+	// should declare w=6, not 3; if it is the natural width, it should be 4, not 3
+	// - the formula rounds (width*1.5) up/down in a way that is not stated
+	// anywhere, and for width 3 it maps 4.5 to 3. Also unclear is how an integer
+	// s=2 combines with n/d; if kitty multiplies them the effective scale is 3,
+	// not 1.5. A spec link plus one worked example in a comment would keep
+	// somebody from "fixing" these numbers later.
 	var b strings.Builder
 	var chunk strings.Builder
 	width := 0

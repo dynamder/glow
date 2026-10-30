@@ -36,6 +36,21 @@ func NewProgram(cfg Config, content string) (*tea.Program, func()) {
 
 	if utils.TextSizingEnabled() {
 		if tty, state, err := openRawTerminal(); err == nil {
+			// NOTE: openRawTerminal() only proves that /dev/tty is usable;
+			// os.Stdout may still be redirected, in which case the painter writes
+			// ANSI frames into a pipe or a file. Gate this on
+			// term.IsTerminal(os.Stdout.Fd()) too.
+			//
+			// NOTE: with tea.WithoutRenderer, bubbletea skips
+			// initTerminal()/initInput() completely, so it never puts the tty in
+			// raw mode and never restores it - raw mode is taken by
+			// openRawTerminal() and given back in painter.stop(). The tty file is
+			// still used by bubbletea's input reader, so stop() must only run
+			// after prog.Run() has returned; that is why it is the cleanup func.
+			//
+			// NOTE: the error is swallowed. When text sizing "does not work",
+			// there is no way to find out whether detection fired, whether the
+			// tty could be opened or whether raw mode failed. At least log.Debug it.
 			painter := newRawPainter(os.Stdout, tty, state, cfg.EnableMouse)
 			prog := tea.NewProgram(
 				paintModel{inner: m, painter: painter},
@@ -47,6 +62,17 @@ func NewProgram(cfg Config, content string) (*tea.Program, func()) {
 		}
 	}
 
+	// BUG: this fallback keeps text sizing enabled. glamour has already put the
+	// heading markers in the style config (utils.GlamourStyle) and
+	// pager.glamourRender rewrites them into OSC 66, but bubbletea's default
+	// renderer parses each frame into a cell buffer and discards an OSC 66
+	// together with its payload text - the heading itself
+	// (charmbracelet/ultraviolet turns "A\x1b]66;s=3;HIDDEN\x1b\\B" into "AB").
+	// Every heading then disappears. This is not hypothetical: GLOW_TEXT_SIZING=on
+	// on a platform where openRawTerminal fails (always on Windows) lands here.
+	// TextSizingEnabled() is cached with sync.OnceValue, so it cannot be turned
+	// back off at this point - the decision has to be made once, before anything
+	// renders, and this branch must be part of it.
 	return tea.NewProgram(m), func() {}
 }
 
@@ -203,6 +229,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmds []tea.Cmd
 
+	// BUG: errMsg is never handled here. It is only handled by the stash
+	// (stash.go), and the top-level switch below only forwards messages to the
+	// active child. So while a document is shown, a renderWithGlamour failure
+	// comes back as errMsg, the pager ignores it, and the user keeps staring at
+	// the previous frame with no indication that anything went wrong.
 	switch msg := msg.(type) {
 	case tea.BackgroundColorMsg:
 		m.common.styles = newStyles(msg.IsDark())
@@ -247,6 +278,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "ctrl+z":
+			// BUG: suspend is broken in the raw-paint path. bubbletea handles
+			// SuspendMsg inside its own event loop (tea.suspend) and releases the
+			// terminal through the renderer; with nilRenderer that is a no-op, so
+			// the parent shell inherits a tty that is still in raw mode, still on
+			// the alternate screen and with the cursor hidden. The model only sees
+			// SuspendMsg after SIGCONT comes back, which is far too late to release
+			// the terminal. The painter has to be stopped before suspending (e.g.
+			// by intercepting this key in paintModel.Update) and restarted on
+			// tea.ResumeMsg.
 			return m, tea.Suspend
 
 		// Ctrl+C always quits no matter where in the application you are.
@@ -330,6 +370,16 @@ func (m model) View() tea.View {
 	}
 
 	v := tea.NewView(content)
+	// the view setting is a pure declaration, whether it  will take effect depend on the render.
+	// on rawpaint, the below doesn't make any sense and will do nothing. we should rehandle all this in our rawpaint function.
+	//
+	// NOTE: and "all this" is more than the two fields below: tea.View also
+	// carries Cursor, ReportFocus, DisableBracketedPasteMode, WindowTitle,
+	// KeyboardEnhancements and a ProgressBar, each of which the default renderer
+	// translates in start()/render(). rawPainter hard-codes only the alt screen
+	// and the mouse mode (from cfg.EnableMouse, not from v), so the two modes
+	// drift apart silently: adding a field here does nothing in the sized path.
+	// A single painter-config struct derived from cfg would keep them in sync.
 	v.AltScreen = true
 	if m.common.cfg.EnableMouse {
 		v.MouseMode = tea.MouseModeCellMotion
